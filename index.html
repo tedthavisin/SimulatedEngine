@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Assignment 2 - Overhead Pick and Place Arm</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #14171c;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    font-family: -apple-system, "Segoe UI", sans-serif;
+    color: #e8ecf1;
+  }
+  h1 { margin: 12px 0 4px; font-size: 20px; }
+  p.sub { margin: 0 0 12px; font-size: 13px; color: #9aa4b2; }
+  canvas {
+    background: #1c2530;
+    border: 2px solid #333c47;
+    border-radius: 6px;
+    display: block;
+  }
+</style>
+</head>
+<body>
+<h1>Conveyor Belt &amp; Arm</h1>
+<p class="sub">A ceiling-mounted arm in the middle swings crates from the infeed belt to the outfeed belt.</p>
+<canvas id="scene" width="900" height="500"></canvas>
+
+<script> "use strict"
+window.onload = function() {
+
+const canvas = document.getElementById('scene');
+const context = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+
+const SWING_ANGLE = 40 * Math.PI / 180;
+const PICKUP_ANGLE = SWING_ANGLE;
+const DROP_ANGLE = -SWING_ANGLE;
+
+const BELT_Y = 380;
+const FLOOR_Y = 460;
+const CRATE = 40;
+
+const L1 = 170;   // the single rigid arm segment - shortened
+const WRIST = 40; // wrist housing + gripper hub, held vertical
+const PIVOT = { x: 450, y: (BELT_Y - CRATE) - L1 * Math.cos(SWING_ANGLE) - WRIST };
+
+const PICKUP = { x: PIVOT.x - L1 * Math.sin(SWING_ANGLE), y: BELT_Y };
+const DROP = { x: PIVOT.x + L1 * Math.sin(SWING_ANGLE), y: BELT_Y };
+
+const INFEED_LEFT = Math.round(PICKUP.x) - 170, INFEED_RIGHT = Math.round(PICKUP.x);
+const OUTFEED_LEFT = Math.round(DROP.x), OUTFEED_RIGHT = Math.round(DROP.x) + 170;
+const MIN_GAP = 55;   // closest two crates on the same belt may sit
+const BELT_SPEED = 35; // px/sec
+
+const SCRIPT = [
+  { angle: PICKUP_ANGLE, grip: 1, dur: 0.6, label: 'grip' },
+  { angle: DROP_ANGLE,   grip: 1, dur: 2.0, label: 'swing-to-drop' },
+  { angle: DROP_ANGLE,   grip: 0, dur: 0.6, label: 'release' },
+  { angle: PICKUP_ANGLE, grip: 0, dur: 2.0, label: 'swing-to-pickup' },
+];
+
+const arm = {
+  stepIndex: 0,
+  stepT: 0,
+  from: { angle: PICKUP_ANGLE, grip: 0 },
+  carrying: false,
+  heldHue: 0,
+};
+
+const infeed = [
+  { x: PICKUP.x, hue: 0 },
+  { x: PICKUP.x - MIN_GAP, hue: 47 },
+];
+const outfeed = [
+  { x: DROP.x, hue: 94 },
+  { x: DROP.x + MIN_GAP, hue: 141 },
+];
+
+function easeInOut(t) { return t * t * (3 - 2 * t); }
+function currentStep() { return SCRIPT[arm.stepIndex]; }
+
+function advanceQueue(queue, wallX, dt) {
+  queue.sort((a, b) => b.x - a.x);
+  for (let i = 0; i < queue.length; i++) {
+    const maxX = i === 0 ? wallX : queue[i - 1].x - MIN_GAP;
+    queue[i].x = Math.min(queue[i].x + BELT_SPEED * dt, maxX);
+  }
+}
+
+function advanceArm(dt) {
+  const step = currentStep();
+  const frontReady = infeed.length > 0 && infeed[0].x >= PICKUP.x - 0.5;
+  if (step.label === 'grip' && !frontReady) return; // wait for a crate to reach the pickup point
+
+  arm.stepT += dt / step.dur;
+  if (arm.stepT >= 1) {
+    arm.stepT = 0;
+    arm.from = { angle: step.angle, grip: step.grip };
+
+    if (step.label === 'grip') {
+      arm.carrying = true;
+      arm.heldHue = infeed.shift().hue;
+    }
+    if (step.label === 'release') {
+      arm.carrying = false;
+      outfeed.push({ x: DROP.x, hue: arm.heldHue });
+    }
+
+    arm.stepIndex = (arm.stepIndex + 1) % SCRIPT.length;
+  }
+}
+
+function armState() {
+  const step = currentStep();
+  const t = easeInOut(Math.min(1, arm.stepT));
+  const angle = arm.from.angle + (step.angle - arm.from.angle) * t;
+  const grip = arm.from.grip + (step.grip - arm.from.grip) * t;
+  return { angle, grip };
+}
+
+// ---------------------------------------------------------------------------
+// Update
+// ---------------------------------------------------------------------------
+const beltDashes = { offset: 0 };
+
+function update(dt) {
+  advanceArm(dt);
+  advanceQueue(infeed, PICKUP.x, dt);
+  advanceQueue(outfeed, OUTFEED_RIGHT, dt);
+
+  // A crate that reaches the end of the outfeed belt loops back to become
+  // the newest arrival at the back of the infeed belt, once there's room.
+  if (outfeed.length > 0) {
+    const front = outfeed[0]; // advanceQueue already sorted it to the front
+    const room = infeed.length === 0 || infeed[infeed.length - 1].x > INFEED_LEFT + MIN_GAP;
+    if (front.x >= OUTFEED_RIGHT - 0.5 && room) {
+      outfeed.shift();
+      infeed.push({ x: INFEED_LEFT, hue: front.hue });
+    }
+  }
+
+  beltDashes.offset = (beltDashes.offset + dt * 15) % 20;
+}
+
+// ---------------------------------------------------------------------------
+// Drawing
+// ---------------------------------------------------------------------------
+function drawBackground() {
+  context.fillStyle = '#1c2530';
+  context.fillRect(0, 0, W, H);
+
+  context.strokeStyle = '#252f3b';
+  context.lineWidth = 1;
+  for (let x = 0; x < W; x += 40) {
+    context.beginPath(); context.moveTo(x, 0); context.lineTo(x, H); context.stroke();
+  }
+
+  // Ceiling rail the arm hangs from.
+  context.fillStyle = '#3d4550';
+  context.fillRect(0, 30, W, 16);
+
+  // General factory floor (kept low enough that the arm's dip never clips it).
+  context.fillStyle = '#262c33';
+  context.fillRect(0, FLOOR_Y, W, H - FLOOR_Y);
+
+  // Two raised conveyor platforms with a gap between them for the arm to swing over.
+  context.fillStyle = '#3a4048';
+  context.fillRect(INFEED_LEFT, BELT_Y, INFEED_RIGHT - INFEED_LEFT, FLOOR_Y - BELT_Y);
+  context.fillRect(OUTFEED_LEFT, BELT_Y, OUTFEED_RIGHT - OUTFEED_LEFT, FLOOR_Y - BELT_Y);
+
+  // Belt surfaces (dashed line sliding = simple non-hierarchical motion cue).
+  context.strokeStyle = '#e8b23d';
+  context.lineWidth = 4;
+  context.setLineDash([10, 10]);
+  context.lineDashOffset = -beltDashes.offset;
+  context.beginPath();
+  context.moveTo(INFEED_LEFT, BELT_Y); context.lineTo(INFEED_RIGHT, BELT_Y);
+  context.moveTo(OUTFEED_LEFT, BELT_Y); context.lineTo(OUTFEED_RIGHT, BELT_Y);
+  context.stroke();
+  context.setLineDash([]);
+}
+
+function drawCrate(x, y, hue, size) {
+  const s = size !== undefined ? size : CRATE;
+  context.save();
+  context.translate(x, y - s / 2);
+  context.fillStyle = `hsl(${hue}, 55%, 50%)`;
+  context.fillRect(-s / 2, -s / 2, s, s);
+  context.strokeStyle = `hsl(${hue}, 55%, 30%)`;
+  context.lineWidth = 3;
+  context.strokeRect(-s / 2, -s / 2, s, s);
+  context.beginPath();
+  context.moveTo(-s / 2, 0); context.lineTo(s / 2, 0);
+  context.moveTo(0, -s / 2); context.lineTo(0, s / 2);
+  context.stroke();
+  context.restore();
+}
+
+function drawGripper(grip) {
+  const HALF_W = 20; // half the crate's width - lines up with its top corners when closed
+  const HEIGHT = 40; // the crate's height - the sides run flush along its edges
+  const MAX_OPEN = 1.1;
+  const swing = MAX_OPEN * (1 - grip);
+
+  context.strokeStyle = '#c7cdd6';
+  context.lineWidth = 6;
+  context.lineCap = 'round';
+  context.lineJoin = 'round';
+
+  for (const side of [-1, 1]) {
+    context.save();
+    context.rotate(-side * swing); // hinge at the origin; closed (swing=0) needs no rotation at all
+    context.beginPath();
+    context.moveTo(0, 0);
+    context.lineTo(side * HALF_W, 0);
+    context.lineTo(side * HALF_W, HEIGHT);
+    context.stroke();
+    context.restore();
+  }
+}
+
+function drawArm(angle, grip, carrying, heldHue) {
+  const wrist = -angle; // cancels the shoulder's rotation so the gripper always hangs straight down
+
+  context.save();
+  context.translate(PIVOT.x, PIVOT.y);
+
+  // mounting bracket on the ceiling rail
+  const strutLen = PIVOT.y - 30; // reaches up to the ceiling rail regardless of pivot height
+  context.fillStyle = '#565f6b';
+  context.fillRect(-16, -strutLen, 32, strutLen + 8);
+  context.fillStyle = '#8a94a1';
+  context.beginPath(); context.arc(0, 0, 13, 0, Math.PI * 2); context.fill();
+
+  context.rotate(angle);
+  context.fillStyle = '#d8dee5';
+  context.fillRect(-9, 0, 18, L1);
+  context.translate(0, L1);
+
+  context.fillStyle = '#8a94a1';
+  context.beginPath(); context.arc(0, 0, 10, 0, Math.PI * 2); context.fill();
+
+  context.rotate(wrist);
+  context.fillStyle = '#8a94a1';
+  context.fillRect(-9, 0, 18, WRIST);
+  context.translate(0, WRIST);
+
+  // gripper (fingers are its two children) and, while carrying, the crate
+  // rides along with every transform above this point in the hierarchy.
+  drawGripper(grip);
+  if (carrying) drawCrate(0, CRATE, heldHue, CRATE);
+
+  context.restore();
+}
+
+// ---------------------------------------------------------------------------
+// Main loop - same processInput -> update -> draw shape as the animation
+// tutorial's mainLoop. Assignment 2 has no user input yet (that's
+// Assignment 3), so processInput is intentionally empty for now.
+// ---------------------------------------------------------------------------
+function processInput() {
+  // no input in Assignment 2 - this is a simulation, not a game yet
+}
+
+function draw() {
+  context.clearRect(0, 0, W, H);
+  drawBackground();
+
+  for (const c of infeed) drawCrate(c.x, BELT_Y, c.hue);
+  for (const c of outfeed) drawCrate(c.x, BELT_Y, c.hue);
+
+  const state = armState();
+  drawArm(state.angle, state.grip, arm.carrying, arm.heldHue);
+}
+
+let lastTime = null;
+function mainLoop(timestamp) {
+  if (lastTime === null) lastTime = timestamp;
+  const dt = Math.min(0.05, (timestamp - lastTime) / 1000);
+  lastTime = timestamp;
+
+  processInput();
+  update(dt);
+  draw();
+
+  requestAnimationFrame(mainLoop); //keep reiterating through this loop
+}
+requestAnimationFrame(mainLoop);
+
+}; // end window.onload
+</script>
+</body>
+</html>
