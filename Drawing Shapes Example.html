@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<!--
+Created using JS Bin
+http://jsbin.com
+
+Copyright (c) 2017 by szafird (http://jsbin.com/rofeyi/2/edit)
+
+Released under the MIT license: http://jsbin.mit-license.org
+-->
+<meta name="robots" content="noindex">
+<html>
+<body>
+	<canvas id="myCanvas" width="200" height="200"></canvas>
+</body>
+<script> "use strict"
+	window.onload = function() {
+		var canvas = document.getElementById('myCanvas');
+		var context = canvas.getContext('2d');
+     
+        //Draw a rectangle (fill)
+        context.beginPath();
+		context.rect(25,65,75,90);
+        context.fillStyle = "#800";
+		context.fill();
+
+        //Draw only the outline of a rectangle (stroke)
+        context.beginPath();
+		context.rect(125,25,90,50);
+        context.strokeStyle = "blue";
+        context.lineWidth = 4;
+		context.stroke();
+      
+        //Draw a circle with fill and stroke
+        context.beginPath();
+        context.arc(50, 150, 25, 0, 2 * Math.PI, false);
+        context.fillStyle = "red";
+		context.fill();
+		context.lineWidth = 1;
+		context.strokeStyle = "grey";
+        context.stroke();
+      
+        //Draw a triangle using moveTo and lineTo
+        context.beginPath();
+        context.moveTo(150,125);
+        context.lineTo(125,175);
+        context.lineTo(290,175);
+        context.closePath();
+        context.fillStyle="yellow";
+        context.fill();
+        context.strokeStyle = "#000";
+        context.stroke();
+	};
+</script>
+<head>
+  <meta name="description" content="Canvas Drawing Example">
+  <meta charset="utf-8">
+  <title>Canvas Drawing Example</title>
+</head>
+</html>
