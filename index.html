@@ -55,6 +55,17 @@
     color: #9aa4b2;
   }
   #hud b { color: #e8ecf1; }
+  #throttle {
+    width: 900px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 8px;
+    font-size: 14px;
+    color: #9aa4b2;
+  }
+  #throttle input { width: 240px; }
+  #FrameRateLabel { color: #e8ecf1; font-weight: bold; min-width: 2ch; }
   kbd {
     background: #262c33;
     border: 1px solid #3d4550;
@@ -72,6 +83,11 @@
 <div id="hud">
   <span><kbd>←</kbd> <kbd>→</kbd> swing &nbsp; <kbd>Space</kbd> grab / release &nbsp; <kbd>R</kbd> restart</span>
   <span id="stats"></span>
+</div>
+<div id="throttle">
+  <label for="FrameRateSlider">Max FPS</label>
+  <input id="FrameRateSlider" type="range" min="1" max="60" value="60">
+  <span id="FrameRateLabel">60</span>
 </div>
 
 <script src="sim.js"></script>
@@ -390,6 +406,15 @@ function draw(alpha) {
 
   if (currState.gameOver) drawGameOver(currState);
   drawHud(currState);
+
+  //draw the fps counter
+  context.textAlign = 'left';
+  context.font = '14px -apple-system, "Segoe UI", sans-serif';
+  context.fillStyle = '#e8ecf1';
+  context.fillText("FPS: " + fps, 10, 20);
+
+  //count a frame as drawn
+  ++framesThisSecond;
 }
 
 // ---------------------------------------------------------------------------
@@ -399,12 +424,38 @@ function draw(alpha) {
 // the leftover fraction (alpha) used for interpolation.
 // ---------------------------------------------------------------------------
 const STEP_MS = Sim.DT * 1000;
-const MAX_FRAME_MS = 250; // after a long pause (hidden tab)
+// Longest frame we'll simulate in one go. It has to cover the slowest slider
+// setting (1 FPS = 1000ms) or the game would slow down when throttled; anything
+// longer (e.g. coming back to a hidden tab) is dropped instead of caught up.
+const MAX_FRAME_MS = 1000;
 let accumulator = 0;
 let lastTime = null;
 let frame = 0;
 
+// FPS counter (from the Game Engine Optimization example): count frames drawn,
+// and once a second copy that count into fps and reset it.
+let fps = 0;
+let framesThisSecond = 0;
+setInterval(function () { fps = framesThisSecond; framesThisSecond = 0; }, 1000);
+
+// Frame-rate throttle slider (from the Variable time step example).
+let maxFps = 60;
+const frameRateSlider = document.getElementById('FrameRateSlider');
+const frameRateLabel = document.getElementById('FrameRateLabel');
+frameRateSlider.addEventListener('input', function () {
+  maxFps = Number(frameRateSlider.value);
+  frameRateLabel.textContent = maxFps;
+});
+
 function mainLoop(timestamp) {
+  // Throttle the frame rate based on the slider value. lastTime isn't touched
+  // when we skip, so the skipped time still reaches the accumulator next frame.
+  // (-1ms of slack keeps 60 FPS from being skipped on high refresh rate screens.)
+  if (lastTime !== null && timestamp < lastTime + (1000 / maxFps) - 1) {
+    requestAnimationFrame(mainLoop);
+    return;
+  }
+
   if (lastTime === null) lastTime = timestamp;
   accumulator += Math.min(MAX_FRAME_MS, timestamp - lastTime);
   lastTime = timestamp;
