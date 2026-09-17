@@ -2,7 +2,30 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Assignment 2 - Overhead Pick and Place Arm</title>
+<title>Assignment 3 - Conveyor Arm Game</title>
+<link rel="icon" href="data:,">
+
+<!--
+  Assignment 3: Building Your Own Game Engine, Part II
+
+  Files:
+    index.html     - controller (keyboard callbacks), main loop, view (canvas drawing)
+    sim.js         - model: deterministic fixed-step simulation, no DOM
+    sim-worker.js  - runs sim.js in a Web Worker
+
+  Run it:  python3 -m http.server 8000   then open http://localhost:8000
+  (Opening index.html via file:// also works; browsers block workers there,
+   so the simulation falls back to the main thread. The HUD shows which is used.)
+
+  Engine features:
+    - fixed-time step (1/60 s), variable rendering main loop
+    - interpolated rendering between the last two simulation states (extra credit)
+    - simulation runs in a Web Worker (extra credit)
+    - determinism check: with Sim.DEBUG on, the console shows identical
+      "tick:" lines every run; only where the "frame:" lines fall changes.
+
+  No external libraries.
+-->
 <style>
   html, body {
     margin: 0;
@@ -23,134 +46,170 @@
     border-radius: 6px;
     display: block;
   }
+  #hud {
+    width: 900px;
+    display: flex;
+    justify-content: space-between;
+    margin-top: 8px;
+    font-size: 14px;
+    color: #9aa4b2;
+  }
+  #hud b { color: #e8ecf1; }
+  kbd {
+    background: #262c33;
+    border: 1px solid #3d4550;
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-family: inherit;
+    color: #e8ecf1;
+  }
 </style>
 </head>
 <body>
 <h1>Conveyor Belt &amp; Arm</h1>
-<p class="sub">A ceiling-mounted arm in the middle swings crates from the infeed belt to the outfeed belt.</p>
+<p class="sub">Move crates from the infeed belt to the outfeed belt. The gripper turns green when it's lined up.</p>
 <canvas id="scene" width="900" height="500"></canvas>
+<div id="hud">
+  <span><kbd>←</kbd> <kbd>→</kbd> swing &nbsp; <kbd>Space</kbd> grab / release &nbsp; <kbd>R</kbd> restart</span>
+  <span id="stats"></span>
+</div>
 
+<script src="sim.js"></script>
 <script> "use strict"
 window.onload = function() {
 
 const canvas = document.getElementById('scene');
 const context = canvas.getContext('2d');
+const statsEl = document.getElementById('stats');
 const W = canvas.width, H = canvas.height;
 
-const SWING_ANGLE = 40 * Math.PI / 180;
-const PICKUP_ANGLE = SWING_ANGLE;
-const DROP_ANGLE = -SWING_ANGLE;
+const { BELT_Y, FLOOR_Y, CRATE, L1, WRIST, PIVOT, BELT_SPEED,
+        INFEED_LEFT, INFEED_RIGHT, OUTFEED_LEFT, OUTFEED_RIGHT } = Sim;
+const CHUTE = 40;
 
-const BELT_Y = 380;
-const FLOOR_Y = 460;
-const CRATE = 40;
+// ---------------------------------------------------------------------------
+// Controller - keyboard callbacks record what the player is doing;
+// processInput() turns that into the input object the simulation consumes.
+// ---------------------------------------------------------------------------
+const held = { left: false, right: false };
+let gripPressed = false;     // one-shot presses, cleared once a sim step consumes them
+let restartPressed = false;
 
-const L1 = 170;   // the single rigid arm segment - shortened
-const WRIST = 40; // wrist housing + gripper hub, held vertical
-const PIVOT = { x: 450, y: (BELT_Y - CRATE) - L1 * Math.cos(SWING_ANGLE) - WRIST };
+const GAME_KEYS = ['ArrowLeft', 'ArrowRight', 'KeyA', 'KeyD', 'Space', 'KeyR'];
 
-const PICKUP = { x: PIVOT.x - L1 * Math.sin(SWING_ANGLE), y: BELT_Y };
-const DROP = { x: PIVOT.x + L1 * Math.sin(SWING_ANGLE), y: BELT_Y };
+window.addEventListener('keydown', function (e) {
+  if (!GAME_KEYS.includes(e.code)) return;
+  e.preventDefault(); // don't scroll the page with arrows / space
+  if (e.code === 'ArrowLeft' || e.code === 'KeyA') held.left = true;
+  if (e.code === 'ArrowRight' || e.code === 'KeyD') held.right = true;
+  if (e.repeat) return; // holding Space shouldn't toggle the gripper over and over
+  if (e.code === 'Space') gripPressed = true;
+  if (e.code === 'KeyR') restartPressed = true;
+});
 
-const INFEED_LEFT = Math.round(PICKUP.x) - 170, INFEED_RIGHT = Math.round(PICKUP.x);
-const OUTFEED_LEFT = Math.round(DROP.x), OUTFEED_RIGHT = Math.round(DROP.x) + 170;
-const MIN_GAP = 55;   // closest two crates on the same belt may sit
-const BELT_SPEED = 35; // px/sec
+window.addEventListener('keyup', function (e) {
+  if (e.code === 'ArrowLeft' || e.code === 'KeyA') held.left = false;
+  if (e.code === 'ArrowRight' || e.code === 'KeyD') held.right = false;
+});
 
-const SCRIPT = [
-  { angle: PICKUP_ANGLE, grip: 1, dur: 0.6, label: 'grip' },
-  { angle: DROP_ANGLE,   grip: 1, dur: 2.0, label: 'swing-to-drop' },
-  { angle: DROP_ANGLE,   grip: 0, dur: 0.6, label: 'release' },
-  { angle: PICKUP_ANGLE, grip: 0, dur: 2.0, label: 'swing-to-pickup' },
-];
+// If the window loses focus we never get the keyup - don't leave the arm swinging.
+function releaseAllKeys() { held.left = false; held.right = false; }
+window.addEventListener('blur', releaseAllKeys);
+document.addEventListener('visibilitychange', function () {
+  if (document.hidden) releaseAllKeys();
+});
 
-const arm = {
-  stepIndex: 0,
-  stepT: 0,
-  from: { angle: PICKUP_ANGLE, grip: 0 },
-  carrying: false,
-  heldHue: 0,
-};
-
-const infeed = [
-  { x: PICKUP.x, hue: 0 },
-  { x: PICKUP.x - MIN_GAP, hue: 47 },
-];
-const outfeed = [
-  { x: DROP.x, hue: 94 },
-  { x: DROP.x + MIN_GAP, hue: 141 },
-];
-
-function easeInOut(t) { return t * t * (3 - 2 * t); }
-function currentStep() { return SCRIPT[arm.stepIndex]; }
-
-function advanceQueue(queue, wallX, dt) {
-  queue.sort((a, b) => b.x - a.x);
-  for (let i = 0; i < queue.length; i++) {
-    const maxX = i === 0 ? wallX : queue[i - 1].x - MIN_GAP;
-    queue[i].x = Math.min(queue[i].x + BELT_SPEED * dt, maxX);
-  }
-}
-
-function advanceArm(dt) {
-  const step = currentStep();
-  const frontReady = infeed.length > 0 && infeed[0].x >= PICKUP.x - 0.5;
-  if (step.label === 'grip' && !frontReady) return; // wait for a crate to reach the pickup point
-
-  arm.stepT += dt / step.dur;
-  if (arm.stepT >= 1) {
-    arm.stepT = 0;
-    arm.from = { angle: step.angle, grip: step.grip };
-
-    if (step.label === 'grip') {
-      arm.carrying = true;
-      arm.heldHue = infeed.shift().hue;
-    }
-    if (step.label === 'release') {
-      arm.carrying = false;
-      outfeed.push({ x: DROP.x, hue: arm.heldHue });
-    }
-
-    arm.stepIndex = (arm.stepIndex + 1) % SCRIPT.length;
-  }
-}
-
-function armState() {
-  const step = currentStep();
-  const t = easeInOut(Math.min(1, arm.stepT));
-  const angle = arm.from.angle + (step.angle - arm.from.angle) * t;
-  const grip = arm.from.grip + (step.grip - arm.from.grip) * t;
-  return { angle, grip };
+function processInput() {
+  const input = { left: held.left, right: held.right, toggleGrip: gripPressed, restart: restartPressed };
+  gripPressed = false;
+  restartPressed = false;
+  return input;
 }
 
 // ---------------------------------------------------------------------------
-// Update
+// Simulation runner - Web Worker when possible, main thread otherwise.
+// Both expose run(n, input) and report back through onSnapshot(prev, curr).
 // ---------------------------------------------------------------------------
-const beltDashes = { offset: 0 };
+let prevState = Sim.createState(Sim.SEED);
+let currState = Sim.createState(Sim.SEED);
 
-function update(dt) {
-  advanceArm(dt);
-  advanceQueue(infeed, PICKUP.x, dt);
-  advanceQueue(outfeed, OUTFEED_RIGHT, dt);
+function onSnapshot(prev, curr) {
+  prevState = prev;
+  currState = curr;
+}
 
-  // A crate that reaches the end of the outfeed belt loops back to become
-  // the newest arrival at the back of the infeed belt, once there's room.
-  if (outfeed.length > 0) {
-    const front = outfeed[0]; // advanceQueue already sorted it to the front
-    const room = infeed.length === 0 || infeed[infeed.length - 1].x > INFEED_LEFT + MIN_GAP;
-    if (front.x >= OUTFEED_RIGHT - 0.5 && room) {
-      outfeed.shift();
-      infeed.push({ x: INFEED_LEFT, hue: front.hue });
-    }
+function createRunner() {
+  function mainThreadRunner() {
+    let state = Sim.createState(Sim.SEED);
+    return {
+      name: 'main thread',
+      run(n, input) {
+        const result = Sim.run(state, n, input);
+        state = result.curr;
+        onSnapshot(result.prev, result.curr);
+      },
+    };
   }
 
-  beltDashes.offset = (beltDashes.offset + dt * 15) % 20;
+  let worker;
+  try {
+    worker = new Worker('sim-worker.js'); // throws on file:// in Chrome
+  } catch (err) {
+    return mainThreadRunner();
+  }
+
+  const runner = {
+    name: 'worker',
+    run(n, input) { worker.postMessage({ type: 'run', n, input }); },
+  };
+  worker.onmessage = function (e) { onSnapshot(e.data.prev, e.data.curr); };
+  worker.onerror = function (e) {
+    // e.g. sim-worker.js failed to load - swap in the main-thread runner
+    e.preventDefault();
+    worker.terminate();
+    Object.assign(runner, mainThreadRunner());
+  };
+  return runner;
+}
+
+const sim = createRunner();
+
+// ---------------------------------------------------------------------------
+// Interpolation
+// ---------------------------------------------------------------------------
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+function lerpState(prev, curr, alpha) {
+  if (prev.game !== curr.game) prev = curr; // never blend across a restart
+
+  const prevCrates = new Map();
+  for (const c of prev.infeed.concat(prev.outfeed, prev.falling)) prevCrates.set(c.id, c);
+
+  function blend(c) {
+    const p = prevCrates.get(c.id);
+    if (!p) return c; // appeared this step (spawned / placed / dropped)
+    const shatter = p.shatter >= 0 && c.shatter >= 0 ? lerp(p.shatter, c.shatter, alpha) : c.shatter;
+    return Object.assign({}, c, { x: lerp(p.x, c.x, alpha), y: lerp(p.y, c.y, alpha), shatter });
+  }
+
+  return {
+    time: lerp(prev.tick, curr.tick, alpha) * Sim.DT,
+    arm: {
+      angle: lerp(prev.arm.angle, curr.arm.angle, alpha),
+      grip: lerp(prev.arm.grip, curr.arm.grip, alpha),
+      carrying: curr.arm.carrying,
+    },
+    hint: Sim.hint(curr),
+    infeed: curr.infeed.map(blend),
+    outfeed: curr.outfeed.map(blend),
+    falling: curr.falling.map(blend),
+  };
 }
 
 // ---------------------------------------------------------------------------
-// Drawing
+// View
 // ---------------------------------------------------------------------------
-function drawBackground() {
+function drawBackground(time) {
   context.fillStyle = '#1c2530';
   context.fillRect(0, 0, W, H);
 
@@ -164,7 +223,7 @@ function drawBackground() {
   context.fillStyle = '#3d4550';
   context.fillRect(0, 30, W, 16);
 
-  // General factory floor (kept low enough that the arm's dip never clips it).
+  // General factory floor.
   context.fillStyle = '#262c33';
   context.fillRect(0, FLOOR_Y, W, H - FLOOR_Y);
 
@@ -173,16 +232,27 @@ function drawBackground() {
   context.fillRect(INFEED_LEFT, BELT_Y, INFEED_RIGHT - INFEED_LEFT, FLOOR_Y - BELT_Y);
   context.fillRect(OUTFEED_LEFT, BELT_Y, OUTFEED_RIGHT - OUTFEED_LEFT, FLOOR_Y - BELT_Y);
 
-  // Belt surfaces (dashed line sliding = simple non-hierarchical motion cue).
+  // Belt surfaces - the dashes slide at the same speed the crates ride.
   context.strokeStyle = '#e8b23d';
   context.lineWidth = 4;
   context.setLineDash([10, 10]);
-  context.lineDashOffset = -beltDashes.offset;
+  context.lineDashOffset = -((time * BELT_SPEED) % 20);
   context.beginPath();
   context.moveTo(INFEED_LEFT, BELT_Y); context.lineTo(INFEED_RIGHT, BELT_Y);
   context.moveTo(OUTFEED_LEFT, BELT_Y); context.lineTo(OUTFEED_RIGHT, BELT_Y);
   context.stroke();
   context.setLineDash([]);
+}
+
+// Chutes at the far ends of the belts - drawn over the crates so they appear
+// to slide in from, and out into, the wall.
+function drawChutes() {
+  context.fillStyle = '#4a525c';
+  context.fillRect(INFEED_LEFT - CHUTE, BELT_Y - CRATE - 14, CHUTE, FLOOR_Y - BELT_Y + CRATE + 14);
+  context.fillRect(OUTFEED_RIGHT, BELT_Y - CRATE - 14, CHUTE, FLOOR_Y - BELT_Y + CRATE + 14);
+  context.fillStyle = '#14171c';
+  context.fillRect(INFEED_LEFT - CHUTE + 6, BELT_Y - CRATE - 6, CHUTE - 6, CRATE + 6);
+  context.fillRect(OUTFEED_RIGHT, BELT_Y - CRATE - 6, CHUTE - 6, CRATE + 6);
 }
 
 function drawCrate(x, y, hue, size) {
@@ -201,13 +271,36 @@ function drawCrate(x, y, hue, size) {
   context.restore();
 }
 
-function drawGripper(grip) {
+// A broken crate w/ its four quarters fly apart, spin, and fade out.
+function drawShatter(c) {
+  const t = Math.min(1, c.shatter / Sim.SHATTER_TIME);
+  const half = CRATE / 2;
+  context.save();
+  context.translate(c.x, c.y - half);
+  context.globalAlpha = 1 - t;
+  for (const qx of [-1, 1]) {
+    for (const qy of [-1, 1]) {
+      context.save();
+      context.translate(qx * t * 30, qy < 0 ? -t * 25 : t * 8);
+      context.rotate(qx * t * 2);
+      context.fillStyle = `hsl(${c.hue}, 55%, 50%)`;
+      context.fillRect(qx < 0 ? -half : 0, qy < 0 ? -half : 0, half, half);
+      context.strokeStyle = `hsl(${c.hue}, 55%, 30%)`;
+      context.lineWidth = 3;
+      context.strokeRect(qx < 0 ? -half : 0, qy < 0 ? -half : 0, half, half);
+      context.restore();
+    }
+  }
+  context.restore();
+}
+
+function drawGripper(grip, color) {
   const HALF_W = 20; // half the crate's width - lines up with its top corners when closed
   const HEIGHT = 40; // the crate's height - the sides run flush along its edges
   const MAX_OPEN = 1.1;
   const swing = MAX_OPEN * (1 - grip);
 
-  context.strokeStyle = '#c7cdd6';
+  context.strokeStyle = color;
   context.lineWidth = 6;
   context.lineCap = 'round';
   context.lineJoin = 'round';
@@ -224,14 +317,14 @@ function drawGripper(grip) {
   }
 }
 
-function drawArm(angle, grip, carrying, heldHue) {
+function drawArm(angle, grip, carrying, linedUp) {
   const wrist = -angle; // cancels the shoulder's rotation so the gripper always hangs straight down
 
   context.save();
   context.translate(PIVOT.x, PIVOT.y);
 
   // mounting bracket on the ceiling rail
-  const strutLen = PIVOT.y - 30; // reaches up to the ceiling rail regardless of pivot height
+  const strutLen = PIVOT.y - 30;
   context.fillStyle = '#565f6b';
   context.fillRect(-16, -strutLen, 32, strutLen + 8);
   context.fillStyle = '#8a94a1';
@@ -252,43 +345,82 @@ function drawArm(angle, grip, carrying, heldHue) {
 
   // gripper (fingers are its two children) and, while carrying, the crate
   // rides along with every transform above this point in the hierarchy.
-  drawGripper(grip);
-  if (carrying) drawCrate(0, CRATE, heldHue, CRATE);
+  drawGripper(grip, linedUp ? '#6fdc8c' : '#c7cdd6');
+  if (carrying) drawCrate(0, CRATE, carrying.hue, CRATE);
 
   context.restore();
 }
 
-// ---------------------------------------------------------------------------
-// Main loop - same processInput -> update -> draw shape as the animation
-// tutorial's mainLoop. Assignment 2 has no user input yet (that's
-// Assignment 3), so processInput is intentionally empty for now.
-// ---------------------------------------------------------------------------
-function processInput() {
-  // no input in Assignment 2 - this is a simulation, not a game yet
+function drawGameOver(state) {
+  context.fillStyle = 'rgba(10, 12, 16, 0.7)';
+  context.fillRect(0, 0, W, H);
+  context.textAlign = 'center';
+  context.fillStyle = '#e8ecf1';
+  context.font = 'bold 36px -apple-system, "Segoe UI", sans-serif';
+  context.fillText('Game Over', W / 2, H / 2 - 30);
+  context.font = '18px -apple-system, "Segoe UI", sans-serif';
+  context.fillStyle = '#9aa4b2';
+  context.fillText(state.gameOverReason + '  Score: ' + state.score, W / 2, H / 2 + 6);
+  context.fillText('Press R to restart', W / 2, H / 2 + 36);
 }
 
-function draw() {
+let lastStats = '';
+function drawHud(state) {
+  const text = `Score <b>${state.score}</b> &nbsp; Best <b>${state.best}</b> &nbsp; ` +
+               `Broken <b>${'❌'.repeat(state.broken)}${'▫️'.repeat(Math.max(0, Sim.MAX_BROKEN - state.broken))}</b> &nbsp; ` +
+               `sim: ${sim.name}`;
+  if (text !== lastStats) { statsEl.innerHTML = text; lastStats = text; }
+}
+
+function draw(alpha) {
+  const view = lerpState(prevState, currState, alpha);
+
   context.clearRect(0, 0, W, H);
-  drawBackground();
+  drawBackground(view.time);
 
-  for (const c of infeed) drawCrate(c.x, BELT_Y, c.hue);
-  for (const c of outfeed) drawCrate(c.x, BELT_Y, c.hue);
+  for (const c of view.infeed) drawCrate(c.x, c.y, c.hue);
+  for (const c of view.outfeed) drawCrate(c.x, c.y, c.hue);
+  for (const c of view.falling) {
+    if (c.shatter >= 0) drawShatter(c);
+    else drawCrate(c.x, c.y, c.hue);
+  }
+  drawChutes();
 
-  const state = armState();
-  drawArm(state.angle, state.grip, arm.carrying, arm.heldHue);
+  drawArm(view.arm.angle, view.arm.grip, view.arm.carrying, view.hint !== null);
+
+  if (currState.gameOver) drawGameOver(currState);
+  drawHud(currState);
 }
 
+// ---------------------------------------------------------------------------
+// Main loop - fixed-time step, variable rendering.
+// Real elapsed time goes into an accumulator; the simulation advances in
+// whole DT-sized steps, and rendering happens once per display frame with
+// the leftover fraction (alpha) used for interpolation.
+// ---------------------------------------------------------------------------
+const STEP_MS = Sim.DT * 1000;
+const MAX_FRAME_MS = 250; // after a long pause (hidden tab)
+let accumulator = 0;
 let lastTime = null;
+let frame = 0;
+
 function mainLoop(timestamp) {
   if (lastTime === null) lastTime = timestamp;
-  const dt = Math.min(0.05, (timestamp - lastTime) / 1000);
+  accumulator += Math.min(MAX_FRAME_MS, timestamp - lastTime);
   lastTime = timestamp;
 
-  processInput();
-  update(dt);
-  draw();
+  //   while (accumulator >= STEP_MS) { update(); accumulator -= STEP_MS; }
+  // except the update() calls (Sim.update in sim.js) run inside the Web Worker:
+  // we tell it how many fixed steps to run, and it sends back the resulting states.
+  const steps = Math.floor(accumulator / STEP_MS);
+  accumulator -= steps * STEP_MS;
+  if (steps > 0) sim.run(steps, processInput()); // input waits for a frame that actually steps
 
-  requestAnimationFrame(mainLoop); //keep reiterating through this loop
+  frame++;
+  if (Sim.DEBUG && currState.tick <= Sim.DEBUG_TICKS) console.log("frame: " + frame);
+  draw(accumulator / STEP_MS);
+
+  requestAnimationFrame(mainLoop);
 }
 requestAnimationFrame(mainLoop);
 
